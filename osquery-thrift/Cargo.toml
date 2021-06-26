@@ -9,13 +9,15 @@ edition = "2018"
 crossbeam = "*"
 
 [dependencies]
-derive_more = "*"
-pretty_env_logger = "*"
-log = "*"
-paste = "1.0"
-thrift = "0.13"
 anyhow = "*"
-thiserror = "*"
+derive_more = "*"
+log = "*"
+maplit = "*"
+paste = "1.0"
+pretty_env_logger = "*"
 serde = { version = "*", features=["derive"]}
 serde_json = "*"
-maplit = "*"
+serde_with = { version = "*", features=["json"]}
+strum = { version = "*", features=["derive"]}
+thiserror = "*"
+thrift = "0.13"

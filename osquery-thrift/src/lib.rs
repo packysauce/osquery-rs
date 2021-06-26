@@ -1,5 +1,5 @@
 use log::{debug, error, info};
-use maplit::btreemap;
+use maplit::{btreemap};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -12,8 +12,8 @@ use thrift::protocol::{
     TBinaryInputProtocol, TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory,
 };
 use thrift::server::TServer;
-use thrift::transport::{TFramedReadTransportFactory, TFramedWriteTransportFactory};
-use thrift::{ApplicationError, TransportError};
+use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
+use thrift::{ApplicationError, ProtocolError, TransportError};
 
 pub use anyhow::Error as AnyError;
 pub use thiserror::Error;
@@ -49,6 +49,12 @@ macro_rules! column_types {
                 }
             }
             )+
+
+            fn to_string(&self) -> String {
+                match self {
+                    $(Self::$variant(v) => v.to_string(),)+
+                }
+            }
         }
 
         $(
@@ -92,10 +98,11 @@ column_types!(Text: String, Integer: i32, BigInt: i64, Double: f64,);
 
 pub type TableColumns = Vec<Column>;
 pub type TableRows = Vec<BTreeMap<String, ColumnValue>>;
+
 pub trait TablePlugin {
     const NAME: &'static str;
     const COLUMNS: &'static [Column];
-    fn generate(&self, query: &QueryContext) -> Result<TableRows, Error>;
+    fn generate(&self, query: &QueryContext) -> Result<TableRows, thrift::Error>;
 }
 
 pub trait Routes: TablePlugin {
@@ -116,28 +123,6 @@ pub trait Routes: TablePlugin {
 }
 
 impl<T> Routes for T where T: TablePlugin {}
-
-#[derive(Default)]
-pub struct ExampleTable;
-
-impl TablePlugin for ExampleTable {
-    const NAME: &'static str = "example_table";
-    const COLUMNS: &'static [Column] = &[
-        Column::text("text"),
-        Column::integer("integer"),
-        Column::big_int("big_int"),
-        Column::double("double"),
-    ];
-
-    fn generate(&self, _query: &QueryContext) -> Result<TableRows, Error> {
-        Ok(vec![btreemap! {
-            "text".to_string() => ColumnValue::text("hello_world"),
-            "integer".to_string() => ColumnValue::integer(123),
-            "big_int".to_string() => ColumnValue::big_int(-123456789),
-            "double".to_string() => ColumnValue::double(std::f64::consts::PI),
-        }])
-    }
-}
 
 impl ExtensionStatus {
     pub fn ok(self) -> Result<Option<String>, thrift::Error> {
@@ -210,9 +195,9 @@ where
             let processor = ExtensionSyncProcessor::new(T::new());
 
             let mut server = TServer::new(
-                TFramedReadTransportFactory::default(),
+                TBufferedReadTransportFactory::default(),
                 TBinaryInputProtocolFactory::default(),
-                TFramedWriteTransportFactory::default(),
+                TBufferedWriteTransportFactory::default(),
                 TBinaryOutputProtocolFactory::default(),
                 processor,
                 10,
@@ -227,9 +212,9 @@ where
             for sock in unix_listener.incoming() {
                 match sock {
                     Ok(mut writer) => {
+                        let mut reader = writer.try_clone()?;
                         let mut tcp_writer = TcpStream::connect(&totally_strong_address)?;
                         let mut tcp_reader = tcp_writer.try_clone()?;
-                        let mut reader = writer.try_clone()?;
                         std::thread::spawn(move || std::io::copy(&mut reader, &mut tcp_writer));
                         std::thread::spawn(move || std::io::copy(&mut tcp_reader, &mut writer));
                     }
@@ -322,22 +307,61 @@ where
         _item: String,
         mut request: ExtensionPluginRequest,
     ) -> thrift::Result<Response> {
-        let data = request.remove("context").ok_or_else(|| {
+        debug!("handling call with request {:?}", &request);
+        let mut get_field = |key| {
+            request.remove(key).ok_or_else(|| {
+                thrift::Error::Application(ApplicationError::new(
+                    thrift::ApplicationErrorKind::ProtocolError,
+                    format!(
+                        "request to `{}` missing required field `{}`",
+                        Self::NAME,
+                        key,
+                    ),
+                ))
+            })
+        };
+        let action = get_field("action")?;
+        let context_data = get_field("context")?;
+        debug!("handling call with context {}", &context_data);
+        let query = serde_json::from_str::<QueryContext>(&context_data).map_err(|e| {
             thrift::Error::Application(ApplicationError::new(
                 thrift::ApplicationErrorKind::ProtocolError,
-                format!(
-                    "request to `{}` missing required field `context`",
-                    Self::NAME
-                ),
+                format!("got error deserializing context: {}\n{}", e, context_data),
             ))
         })?;
-        let _context = serde_json::from_str::<QueryContext>(&data).map_err(|e| {
-            thrift::Error::Application(ApplicationError::new(
-                thrift::ApplicationErrorKind::ProtocolError,
-                format!("PluginRequest failed to deserialize QueryContext: {}", e),
-            ))
-        });
-        todo!()
+
+        let output = match action.as_str() {
+            "generate" => self
+                .generate(&query)?
+                .into_iter()
+                .map(|v| {
+                    v.into_iter()
+                        .map(|(k, v)| (k, v.to_string()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .collect(),
+            "columns" => Self::COLUMNS
+                .iter()
+                .cloned()
+                .map(|c| btreemap! { c.name.to_string() => c.kind.to_string() })
+                .collect::<Vec<_>>(),
+            other => {
+                return Err(thrift::Error::Protocol(ProtocolError::new(
+                    thrift::ProtocolErrorKind::NotImplemented,
+                    format!("action `{}` not supported on plugin type `table`", other),
+                )))
+            }
+        };
+        let response = Response {
+            status: Some(Status {
+                code: Some(Code::ExtSuccess as i32),
+                message: None,
+                uuid: None,
+            }),
+            response: Some(output),
+        };
+
+        Ok(response)
     }
 
     fn handle_shutdown(&self) -> thrift::Result<()> {
