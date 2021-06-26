@@ -7,3 +7,4 @@
     renamed_and_removed_lints
 )]
 pub mod osquery;
+pub mod table;

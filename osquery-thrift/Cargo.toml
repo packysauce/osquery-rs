@@ -5,6 +5,17 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dev-dependencies]
+crossbeam = "*"
+
 [dependencies]
+derive_more = "*"
+pretty_env_logger = "*"
+log = "*"
 paste = "1.0"
 thrift = "0.13"
+anyhow = "*"
+thiserror = "*"
+serde = { version = "*", features=["derive"]}
+serde_json = "*"
+maplit = "*"
