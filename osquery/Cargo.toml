@@ -16,10 +16,8 @@ readme = "../README.md"
 [dev-dependencies]
 
 [dependencies]
-anyhow = "*"
 crossbeam = "*"
 derive_more = "*"
-hexdump = "*"
 tracing = "*"
 tracing-subscriber = {version = "*", features = ["json"]}
 maplit = "*"

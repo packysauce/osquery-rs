@@ -1,13 +1,12 @@
 use std::{thread::sleep, time::Duration};
 
-use anyhow::Result;
 use maplit::btreemap;
 use osquery::{
     Client, Column, ColumnValue, QueryContext, TExtensionManagerSyncClient, TablePlugin, TableRows,
 };
 use tracing::{debug, error, info};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ExampleTable;
 
 impl TablePlugin for ExampleTable {
@@ -29,9 +28,9 @@ impl TablePlugin for ExampleTable {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), Box<dyn (std::error::Error)>> {
     tracing_subscriber::fmt()
-        .with_env_filter("tester=trace,osquery_thrift=trace,info")
+        .with_env_filter("tester=trace,osquery=trace,info")
         .pretty()
         .init();
     info!("Getting a client put together");

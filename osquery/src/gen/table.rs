@@ -16,8 +16,6 @@ pub struct Context;
 
 pub type Row = HashMap<String, String>;
 
-pub trait GenerateFunc: Fn(Context) -> Result<Vec<Row>, anyhow::Error> {}
-
 // ColumnDefinition defines the relevant information for a column in a table
 // plugin. Both values are mandatory. Prefer using the *Column helpers to
 // create ColumnDefinition structs.

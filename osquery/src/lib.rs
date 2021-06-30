@@ -12,9 +12,8 @@ use thrift::protocol::TBinaryOutputProtocol;
 use thrift::server::{TProcessor};
 use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport};
 use thrift::{ApplicationError, ProtocolError, TransportError, TransportErrorKind};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
-pub use anyhow::Error as AnyError;
 pub use thiserror::Error;
 pub use thrift;
 
@@ -232,7 +231,7 @@ fn run_metaserver<T: Default + ExtensionSyncHandler + Send + Sync + 'static>(
 
 impl<T: 'static> Handle<T>
 where
-    T: TablePlugin + Default + Send + Sync,
+    T: TablePlugin + Debug + Default + Send + Sync,
 {
     #[tracing::instrument(skip(self), fields(T = "std::any::type_name::<T>()"))]
     pub fn start(&self) -> JoinHandle<Result<(), thrift::Error>> {
@@ -300,9 +299,11 @@ impl Client {
 
 impl<T> ExtensionSyncHandler for T
 where
-    T: TablePlugin,
+    T: TablePlugin + Debug,
 {
+    #[instrument(level = "trace")]
     fn handle_ping(&self) -> thrift::Result<ExtensionStatus> {
+        trace!("pong");
         Ok(ExtensionStatus {
             code: Some(Code::ExtSuccess as i32),
             message: Some("OK".to_string()),
@@ -310,6 +311,7 @@ where
         })
     }
 
+    #[instrument(level = "trace")]
     fn handle_call(
         &self,
         _registry: String,
@@ -373,6 +375,7 @@ where
         Ok(response)
     }
 
+    #[instrument(level = "trace")]
     fn handle_shutdown(&self) -> thrift::Result<()> {
         let _ = self.shutdown();
         Ok(())
