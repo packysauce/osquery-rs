@@ -10,7 +10,7 @@ src/gen/osquery.rs: osquery.thrift
 	mkdir -p src/gen
 	thrift -out src/gen --gen rs -r osquery.thrift
 
-.PHONY:all 
+.PHONY: all
 all: src/gen/osquery.rs osquery.thrift
 
 .PHONY: clean

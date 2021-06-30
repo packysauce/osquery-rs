@@ -2,7 +2,7 @@ use std::{thread::sleep, time::Duration};
 
 use anyhow::Result;
 use maplit::btreemap;
-use osquery_thrift::{
+use osquery::{
     Client, Column, ColumnValue, QueryContext, TExtensionManagerSyncClient, TablePlugin, TableRows,
 };
 use tracing::{debug, error, info};

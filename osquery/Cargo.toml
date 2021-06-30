@@ -1,7 +1,15 @@
 [package]
 name = "osquery"
+authors = ["Patrick White <patrick@patrickwhite.org>"]
+description = "osquery external plugin framework"
 version = "0.1.5"
 edition = "2018"
+license = "Apache-2.0"
+repository = "https://github.com/packysauce/osquery-rs/tree/sacred_timeline/osquery"
+keywords = ["osquery", "plugin", "sysadmin", "tools"]
+homepage = "https://github.com/packysauce/osquery-rs/tree/sacred_timeline/osquery"
+categories = ["database-implementations", "api-bindings"]
+readme = "../README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
