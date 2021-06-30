@@ -1,12 +1,11 @@
 use std::{thread::sleep, time::Duration};
 
 use anyhow::Result;
-use log::{debug, error, info};
 use maplit::btreemap;
 use osquery_thrift::{
-    Client, Column, ColumnValue, QueryContext, TExtensionManagerSyncClient, TablePlugin,
-    TableRows,
+    Client, Column, ColumnValue, QueryContext, TExtensionManagerSyncClient, TablePlugin, TableRows,
 };
+use tracing::{debug, error, info};
 
 #[derive(Default)]
 pub struct ExampleTable;
@@ -31,8 +30,9 @@ impl TablePlugin for ExampleTable {
 }
 
 fn main() -> Result<()> {
-    pretty_env_logger::formatted_timed_builder()
-        .filter_level(log::LevelFilter::Trace)
+    tracing_subscriber::fmt()
+        .with_env_filter("tester=trace,osquery_thrift=trace,info")
+        .pretty()
         .init();
     info!("Getting a client put together");
     let mut client = Client::connect("/home/packy/.osquery/shell.em")?;

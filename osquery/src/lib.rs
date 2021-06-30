@@ -1,19 +1,18 @@
-use log::{debug, error, info};
-use maplit::{btreemap};
+use maplit::btreemap;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use thrift::protocol::TBinaryInputProtocol;
 use thrift::protocol::TBinaryOutputProtocol;
-use thrift::protocol::{
-    TBinaryInputProtocol, TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory,
-};
-use thrift::server::TServer;
-use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
-use thrift::{ApplicationError, ProtocolError, TransportError};
+use thrift::server::{TProcessor};
+use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport};
+use thrift::{ApplicationError, ProtocolError, TransportError, TransportErrorKind};
+use tracing::{debug, error, info, instrument, warn};
 
 pub use anyhow::Error as AnyError;
 pub use thiserror::Error;
@@ -29,6 +28,8 @@ pub use ExtensionResponse as Response;
 pub use ExtensionStatus as Status;
 
 use self::gen::table::ColumnType;
+
+mod util;
 
 #[derive(Debug, Error)]
 pub enum Error {}
@@ -103,6 +104,7 @@ pub trait TablePlugin {
     const NAME: &'static str;
     const COLUMNS: &'static [Column];
     fn generate(&self, query: &QueryContext) -> Result<TableRows, thrift::Error>;
+    fn shutdown(&self) {}
 }
 
 pub trait Routes: TablePlugin {
@@ -144,7 +146,6 @@ type BinaryOut = TBinaryOutputProtocol<UnixStream>;
 pub struct Handle<T> {
     socket_path: PathBuf,
     uuid: i64,
-    port: u16,
     _marker: PhantomData<T>,
 }
 
@@ -160,80 +161,89 @@ impl<T> Handle<T>
 where
     T: Plugin,
 {
-    fn new<P: AsRef<Path>>(path: P, port: u16, uuid: i64) -> Self {
+    fn new<P: AsRef<Path>>(path: P, uuid: i64) -> Self {
         Handle {
             socket_path: path.as_ref().into(),
             uuid,
-            port,
             _marker: Default::default(),
         }
     }
+}
+
+#[instrument]
+fn run_metaserver<T: Default + ExtensionSyncHandler + Send + Sync + 'static>(
+    uuid: i64,
+    mut socket_path: PathBuf,
+) -> Result<(), thrift::Error> {
+    let mut name = socket_path
+        .file_name()
+        .ok_or_else(|| {
+            thrift::Error::Transport(TransportError::new(
+                thrift::TransportErrorKind::NotOpen,
+                format!("Invalid osquery socket path `{:?}`", socket_path),
+            ))
+        })?
+        .to_os_string();
+    name.push(&format!(".{}", uuid));
+    socket_path.set_file_name(name);
+
+    // stand up the sync processor (the thing that knows how to go from thrift -> Plugin)
+    let processor = Arc::new(ExtensionSyncProcessor::new(T::default()));
+    // listen on the unix socket we got back from osquery
+    let unix_listener = UnixListener::bind(&socket_path)?;
+    info!("Listening at {:?}", socket_path);
+
+    for sock in unix_listener.incoming() {
+        match sock {
+            Ok(stream) => {
+                // every time we get a connection, grab a copy of the processor and get to steppin
+                let processor = processor.clone();
+                std::thread::spawn(move || {
+                    debug!(?stream, "new connection");
+                    let i_trans = TBufferedReadTransport::new(stream.try_clone()?);
+                    let o_trans = TBufferedWriteTransport::new(stream);
+                    let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
+                    let mut o_prot = TBinaryOutputProtocol::new(o_trans, true);
+                    loop {
+                        match processor.process(&mut i_prot, &mut o_prot) {
+                            Ok(_) => {}
+                            Err(thrift::Error::Transport(TransportError {
+                                kind: TransportErrorKind::EndOfFile,
+                                ..
+                            })) => break,
+                            Err(e) => {
+                                warn!(error=%e, "processor completed with error");
+                                break;
+                            }
+                        }
+                    }
+                    Ok::<_, thrift::Error>(())
+                });
+            }
+            Err(e) => {
+                error!("incoming connection had a problem! {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+    info!("listener shut down");
+    Ok(())
 }
 
 impl<T: 'static> Handle<T>
 where
     T: TablePlugin + Default + Send + Sync,
 {
+    #[tracing::instrument(skip(self), fields(T = "std::any::type_name::<T>()"))]
     pub fn start(&self) -> JoinHandle<Result<(), thrift::Error>> {
         let uuid = self.uuid;
-        let port = self.port;
-        let mut socket_path = self.socket_path.clone();
-        std::thread::spawn(move || {
-            let mut name = socket_path
-                .file_name()
-                .ok_or_else(|| {
-                    thrift::Error::Transport(TransportError::new(
-                        thrift::TransportErrorKind::NotOpen,
-                        format!("Invalid osquery socket path `{:?}`", socket_path),
-                    ))
-                })?
-                .to_os_string();
-            name.push(&format!(".{}", uuid));
-            socket_path.set_file_name(name);
-            info!("Listening at {:?}", socket_path);
-            /* get rando local listener */
-            let processor = ExtensionSyncProcessor::new(T::new());
-
-            let mut server = TServer::new(
-                TBufferedReadTransportFactory::default(),
-                TBinaryInputProtocolFactory::default(),
-                TBufferedWriteTransportFactory::default(),
-                TBinaryOutputProtocolFactory::default(),
-                processor,
-                10,
-            );
-
-            let totally_strong_address = format!("localhost:{}", port);
-            let addr = totally_strong_address.clone();
-            let _tcp_listener = std::thread::spawn(move || server.listen(&addr));
-
-            /* set up unix listener */
-            let unix_listener = UnixListener::bind(socket_path)?;
-            for sock in unix_listener.incoming() {
-                match sock {
-                    Ok(mut writer) => {
-                        let mut reader = writer.try_clone()?;
-                        let mut tcp_writer = TcpStream::connect(&totally_strong_address)?;
-                        let mut tcp_reader = tcp_writer.try_clone()?;
-                        std::thread::spawn(move || std::io::copy(&mut reader, &mut tcp_writer));
-                        std::thread::spawn(move || std::io::copy(&mut tcp_reader, &mut writer));
-                    }
-                    Err(e) => {
-                        error!("incoming connection had a problem! {}", e);
-                    }
-                }
-            }
-            /* start std::io::copy thread(s) */
-            /* feed to TServer! */
-
-            Ok(())
-        })
+        let socket_path = self.socket_path.clone();
+        std::thread::spawn(move || run_metaserver::<T>(uuid, socket_path))
     }
 }
 
 #[derive(derive_more::Deref, derive_more::DerefMut)]
 pub struct Client {
-    port: u16,
     socket_path: std::path::PathBuf,
     #[deref]
     #[deref_mut]
@@ -247,7 +257,6 @@ impl Client {
         let input_protocol = TBinaryInputProtocol::new(reader, false);
         let output_protocol = TBinaryOutputProtocol::new(writer, false);
         Ok(Self {
-            port: 8080,
             socket_path: path.as_ref().into(),
             server: ExtensionManagerSyncClient::new(input_protocol, output_protocol),
         })
@@ -285,7 +294,7 @@ impl Client {
                 "Got no UUID from osquery",
             )
         })?;
-        Ok(Handle::new(&self.socket_path, self.port, uuid))
+        Ok(Handle::new(&self.socket_path, uuid))
     }
 }
 
@@ -365,6 +374,7 @@ where
     }
 
     fn handle_shutdown(&self) -> thrift::Result<()> {
-        todo!()
+        let _ = self.shutdown();
+        Ok(())
     }
 }
