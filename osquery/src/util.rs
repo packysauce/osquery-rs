@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::io::{Error as IoError, Read, Write};
-use std::net::{TcpStream};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use tracing::trace;
 
@@ -10,6 +10,7 @@ pub struct SpyIO<T> {
 }
 
 impl SpyIO<TcpStream> {
+    #[allow(dead_code)]
     pub fn try_clone(&self) -> Result<Self, IoError> {
         Ok(Self {
             inner: self.inner.try_clone()?,
@@ -19,6 +20,7 @@ impl SpyIO<TcpStream> {
 }
 
 impl SpyIO<UnixStream> {
+    #[allow(dead_code)]
     pub fn try_clone(&self) -> Result<Self, IoError> {
         Ok(Self {
             inner: self.inner.try_clone()?,
@@ -43,6 +45,7 @@ impl<T: Debug> Debug for SpyIO<T> {
 }
 
 impl<T: Read + Write> SpyIO<T> {
+    #[allow(dead_code)]
     pub(crate) fn new(inner: T, preview: usize) -> Self {
         Self { inner, preview }
     }
