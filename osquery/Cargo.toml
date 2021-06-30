@@ -14,8 +14,10 @@ readme = "../README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dev-dependencies]
+dirs = "*"
 
 [dependencies]
+dirs = "*"
 crossbeam = "*"
 derive_more = "*"
 tracing = "*"

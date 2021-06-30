@@ -34,7 +34,9 @@ fn main() -> Result<(), Box<dyn (std::error::Error)>> {
         .pretty()
         .init();
     info!("Getting a client put together");
-    let mut client = Client::connect("/home/packy/.osquery/shell.em")?;
+    let mut home = dirs::home_dir().expect("no home dir?");
+    home.extend(&[".osquery", "shell.em"]);
+    let mut client = Client::connect(&home)?;
     debug!("ostensibly connected");
     let table = client.register_table::<ExampleTable>()?;
     let handle = table.start();
