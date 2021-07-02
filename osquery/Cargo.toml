@@ -28,6 +28,7 @@ pretty_env_logger = "*"
 rayon = "*"
 serde = { version = "*", features=["derive"]}
 serde_json = "*"
+serde_repr = "0.1.7"
 serde_with = { version = "*", features=["json"]}
 strum = { version = "*", features=["derive"]}
 thiserror = "*"

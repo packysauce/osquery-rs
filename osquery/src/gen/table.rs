@@ -73,7 +73,8 @@ pub struct Constraint {
 }
 
 // Operator is an enum of the osquery operators.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(serde_repr::Serialize_repr, serde_repr::Deserialize_repr, Debug, PartialEq, Clone)]
+#[repr(u8)]
 pub enum Operator {
     Equals = 2,
     GreaterThan = 4,
