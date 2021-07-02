@@ -2,7 +2,7 @@
 name = "osquery"
 authors = ["Patrick White <patrick@patrickwhite.org>"]
 description = "osquery external plugin framework"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2018"
 license = "Apache-2.0"
 repository = "https://github.com/packysauce/osquery-rs/tree/sacred_timeline/osquery"
