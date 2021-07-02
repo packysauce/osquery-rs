@@ -68,8 +68,8 @@ pub struct ConstraintList {
 // constraints in the query.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Constraint {
-    pub operator: Operator,
-    pub expression: String,
+    pub op: Operator,
+    pub expr: String,
 }
 
 // Operator is an enum of the osquery operators.
