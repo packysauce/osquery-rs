@@ -7,12 +7,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use thrift::protocol::TBinaryInputProtocol;
 use thrift::protocol::TBinaryOutputProtocol;
-use thrift::server::{TProcessor};
+use thrift::server::TProcessor;
 use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport};
 use thrift::{ApplicationError, ProtocolError, TransportError, TransportErrorKind};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, info_span, instrument, trace, warn};
 
 pub use thiserror::Error;
 pub use thrift;
@@ -192,13 +193,14 @@ fn run_metaserver<T: Default + ExtensionSyncHandler + Send + Sync + 'static>(
     let unix_listener = UnixListener::bind(&socket_path)?;
     info!("Listening at {:?}", socket_path);
 
+    let _span = info_span!("listening").entered();
     for sock in unix_listener.incoming() {
         match sock {
             Ok(stream) => {
                 // every time we get a connection, grab a copy of the processor and get to steppin
                 let processor = processor.clone();
                 std::thread::spawn(move || {
-                    debug!(?stream, "new connection");
+                    let _span = info_span!("new connection", ?stream).entered();
                     let i_trans = TBufferedReadTransport::new(stream.try_clone()?);
                     let o_trans = TBufferedWriteTransport::new(stream);
                     let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
@@ -209,7 +211,9 @@ fn run_metaserver<T: Default + ExtensionSyncHandler + Send + Sync + 'static>(
                             Err(thrift::Error::Transport(TransportError {
                                 kind: TransportErrorKind::EndOfFile,
                                 ..
-                            })) => break,
+                            })) => {
+                                break;
+                            }
                             Err(e) => {
                                 warn!(error=%e, "processor completed with error");
                                 break;
@@ -250,8 +254,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self, thrift::Error> {
+    pub fn connect<P: AsRef<Path>>(path: P, timeout: Duration) -> Result<Self, thrift::Error> {
         let reader = UnixStream::connect(&path)?;
+        debug!(?timeout, "set timeout on read and write streams");
+        reader.set_read_timeout(Some(timeout))?;
+        reader.set_write_timeout(Some(timeout))?;
         let writer = reader.try_clone()?;
         let input_protocol = TBinaryInputProtocol::new(reader, false);
         let output_protocol = TBinaryOutputProtocol::new(writer, false);
@@ -272,7 +279,7 @@ impl Client {
         );
         let registry = serde_json::from_value(json!({
             "table": {
-                "example_plugin": T::routes(),
+                (T::NAME) : T::routes(),
             }
         }))
         .map_err(|e| {
@@ -301,9 +308,9 @@ impl<T> ExtensionSyncHandler for T
 where
     T: TablePlugin + Debug,
 {
-    #[instrument(level = "trace")]
+    #[instrument(target = "osquery::ping", level = "trace")]
     fn handle_ping(&self) -> thrift::Result<ExtensionStatus> {
-        trace!("pong");
+        trace!(target = "osquery::ping", "pong");
         Ok(ExtensionStatus {
             code: Some(Code::ExtSuccess as i32),
             message: Some("OK".to_string()),
