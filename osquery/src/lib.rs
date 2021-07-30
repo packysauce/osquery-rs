@@ -2,7 +2,7 @@ use maplit::btreemap;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::marker::PhantomData;
+use std::io::ErrorKind;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,9 +15,8 @@ use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport};
 use thrift::{ApplicationError, ProtocolError, TransportError, TransportErrorKind};
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 
-pub use thiserror::Error;
+pub use anyhow::{anyhow, Error};
 pub use thrift;
-
 pub mod gen;
 pub use gen::osquery::ExtensionPluginRequest as PluginRequest;
 pub use gen::osquery::ExtensionPluginResponse as PluginResponse;
@@ -30,9 +29,6 @@ pub use ExtensionStatus as Status;
 use self::gen::table::ColumnType;
 
 mod util;
-
-#[derive(Debug, Error)]
-pub enum Error {}
 
 macro_rules! column_types {
     ($($variant:ident : $kind:ty,)+) => { column_types!($( $variant : $kind ),+ ); };
@@ -83,9 +79,9 @@ macro_rules! column_types {
         impl Column {
             $(
             ::paste::paste! {
-                pub const fn [< $variant:snake >](name: &'static str) -> Column {
+                pub fn [< $variant:snake >](name: &str) -> Column {
                     Column {
-                        name,
+                        name: name.to_string(),
                         kind: ColumnType::[< $variant:camel >]
                     }
                 }
@@ -100,16 +96,30 @@ column_types!(Text: String, Integer: i32, BigInt: i64, Double: f64,);
 pub type TableColumns = Vec<Column>;
 pub type TableRows = Vec<BTreeMap<String, ColumnValue>>;
 
-pub trait TablePlugin {
-    const NAME: &'static str;
-    const COLUMNS: &'static [Column];
-    fn generate(&self, query: &QueryContext) -> Result<TableRows, thrift::Error>;
-    fn shutdown(&self) {}
+pub trait TablePlugin: Plugin {
+    fn generate(&self, query: &QueryContext) -> Result<TableRows, Self::Error>;
+    fn columns(&self) -> Result<Vec<Column>, Self::Error>;
+    fn shutdown(&self);
 }
 
-pub trait Routes: TablePlugin {
-    fn routes() -> ExtensionPluginResponse {
-        Self::COLUMNS
+pub trait Routes {
+    fn routes(&self) -> ExtensionPluginResponse;
+}
+
+impl<T> Routes for T
+where
+    T: TablePlugin,
+{
+    fn routes(&self) -> ExtensionPluginResponse {
+        let columns = match self.columns() {
+            Ok(col) => col,
+            Err(error) => {
+                error!(table=std::any::type_name::<Self>(), %error, "problem getting columns for routes");
+                return vec![];
+            }
+        };
+
+        columns
             .iter()
             .map(|col| {
                 serde_json::from_value(serde_json::json!({
@@ -123,8 +133,6 @@ pub trait Routes: TablePlugin {
             .collect()
     }
 }
-
-impl<T> Routes for T where T: TablePlugin {}
 
 impl ExtensionStatus {
     pub fn ok(self) -> Result<Option<String>, thrift::Error> {
@@ -143,105 +151,117 @@ impl ExtensionStatus {
 type BinaryIn = TBinaryInputProtocol<UnixStream>;
 type BinaryOut = TBinaryOutputProtocol<UnixStream>;
 
+#[derive(Debug)]
 pub struct Handle<T> {
     socket_path: PathBuf,
-    uuid: i64,
-    _marker: PhantomData<T>,
+    server: T,
 }
 
-// do i need this shit?
-pub trait Plugin: Default {
-    fn new() -> Self {
-        Self::default()
+pub trait Plugin: Routes + Sized {
+    type Error: std::error::Error + Send + Sync + 'static;
+    const NAME: &'static str;
+    fn new() -> Self;
+    fn install(self, client: &mut Client) -> Result<Handle<Self>, thrift::Error> {
+        let info = InternalExtensionInfo::new(
+            Some(Self::NAME.to_string()),
+            env!("CARGO_PKG_VERSION").to_string(),
+            None,
+            None,
+        );
+        let registry = serde_json::from_value(json!({
+            "table": {
+                (Self::NAME) : self.routes(),
+            }
+        }))
+        .map_err(|e| {
+            ApplicationError::new(
+                thrift::ApplicationErrorKind::InternalError,
+                format!("Failed to generate routes: {}", e),
+            )
+        })?;
+        let status = client.register_extension(info, registry)?;
+        debug!(
+            "registered extension from {}, got back {:?}",
+            std::any::type_name::<Self>(),
+            &status
+        );
+        let uuid = status.uuid.ok_or_else(|| {
+            ApplicationError::new(
+                thrift::ApplicationErrorKind::ProtocolError,
+                "Got no UUID from osquery",
+            )
+        })?;
+        Ok(Handle::new(client.socket_path(uuid)?, self))
     }
 }
-impl<T> Plugin for T where T: TablePlugin + Default {}
 
 impl<T> Handle<T>
 where
     T: Plugin,
 {
-    fn new<P: AsRef<Path>>(path: P, uuid: i64) -> Self {
+    pub fn new<P: AsRef<Path>>(path: P, server: T) -> Self {
         Handle {
             socket_path: path.as_ref().into(),
-            uuid,
-            _marker: Default::default(),
+            server,
         }
     }
-}
-
-#[instrument]
-fn run_metaserver<T: Default + ExtensionSyncHandler + Send + Sync + 'static>(
-    uuid: i64,
-    mut socket_path: PathBuf,
-) -> Result<(), thrift::Error> {
-    let mut name = socket_path
-        .file_name()
-        .ok_or_else(|| {
-            thrift::Error::Transport(TransportError::new(
-                thrift::TransportErrorKind::NotOpen,
-                format!("Invalid osquery socket path `{:?}`", socket_path),
-            ))
-        })?
-        .to_os_string();
-    name.push(&format!(".{}", uuid));
-    socket_path.set_file_name(name);
-
-    // stand up the sync processor (the thing that knows how to go from thrift -> Plugin)
-    let processor = Arc::new(ExtensionSyncProcessor::new(T::default()));
-    // listen on the unix socket we got back from osquery
-    let unix_listener = UnixListener::bind(&socket_path)?;
-    info!("Listening at {:?}", socket_path);
-
-    let _span = info_span!("listening").entered();
-    for sock in unix_listener.incoming() {
-        match sock {
-            Ok(stream) => {
-                // every time we get a connection, grab a copy of the processor and get to steppin
-                let processor = processor.clone();
-                std::thread::spawn(move || {
-                    let _span = info_span!("new connection", ?stream).entered();
-                    let i_trans = TBufferedReadTransport::new(stream.try_clone()?);
-                    let o_trans = TBufferedWriteTransport::new(stream);
-                    let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
-                    let mut o_prot = TBinaryOutputProtocol::new(o_trans, true);
-                    loop {
-                        match processor.process(&mut i_prot, &mut o_prot) {
-                            Ok(_) => {}
-                            Err(thrift::Error::Transport(TransportError {
-                                kind: TransportErrorKind::EndOfFile,
-                                ..
-                            })) => {
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(error=%e, "processor completed with error");
-                                break;
-                            }
-                        }
-                    }
-                    Ok::<_, thrift::Error>(())
-                });
-            }
-            Err(e) => {
-                error!("incoming connection had a problem! {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-    info!("listener shut down");
-    Ok(())
 }
 
 impl<T: 'static> Handle<T>
 where
-    T: TablePlugin + Debug + Default + Send + Sync,
+    T: TablePlugin + Debug + Send + Sync,
 {
     #[tracing::instrument(skip(self), fields(T = "std::any::type_name::<T>()"))]
-    pub fn start(&self) -> JoinHandle<Result<(), thrift::Error>> {
-        let uuid = self.uuid;
-        let socket_path = self.socket_path.clone();
-        std::thread::spawn(move || run_metaserver::<T>(uuid, socket_path))
+    pub fn start(self) -> Result<JoinHandle<Result<(), thrift::Error>>, Error> {
+        let socket_path = self.socket_path;
+
+        // stand up the sync processor (the thing that knows how to go from thrift -> Plugin)
+        let processor = Arc::new(ExtensionSyncProcessor::new(self.server));
+        // listen on the unix socket we got back from osquery
+        let unix_listener = UnixListener::bind(&socket_path)?;
+        info!("Listening at {:?}", socket_path);
+
+        let _span = info_span!("listening").entered();
+        let handle = std::thread::spawn(move || {
+            for sock in unix_listener.incoming() {
+                match sock {
+                    Ok(stream) => {
+                        // every time we get a connection, grab a copy of the processor and get to steppin
+                        let processor = processor.clone();
+                        std::thread::spawn(move || {
+                            let _span = info_span!("new connection", ?stream).entered();
+                            let i_trans = TBufferedReadTransport::new(stream.try_clone()?);
+                            let o_trans = TBufferedWriteTransport::new(stream);
+                            let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
+                            let mut o_prot = TBinaryOutputProtocol::new(o_trans, true);
+                            loop {
+                                match processor.process(&mut i_prot, &mut o_prot) {
+                                    Ok(_) => {}
+                                    Err(thrift::Error::Transport(TransportError {
+                                        kind: TransportErrorKind::EndOfFile,
+                                        ..
+                                    })) => {
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!(error=%e, "processor completed with error");
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok::<_, thrift::Error>(())
+                        });
+                    }
+                    Err(e) => {
+                        error!("incoming connection had a problem! {}", e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            info!("listener shut down");
+            Ok(())
+        });
+        Ok(handle)
     }
 }
 
@@ -254,6 +274,21 @@ pub struct Client {
 }
 
 impl Client {
+
+    pub fn socket_path(&self, uuid: ExtensionRouteUUID) -> Result<PathBuf, std::io::Error> {
+        let mut socket_path = self.socket_path.clone();
+        let mut name = socket_path
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidData, socket_path.to_string_lossy())
+            })?
+            .to_os_string();
+        name.push(&format!(".{}", uuid));
+        socket_path.set_file_name(name);
+        Ok(socket_path)
+    }
+
+
     pub fn connect<P: AsRef<Path>>(path: P, timeout: Duration) -> Result<Self, thrift::Error> {
         let reader = UnixStream::connect(&path)?;
         debug!(?timeout, "set timeout on read and write streams");
@@ -268,39 +303,13 @@ impl Client {
         })
     }
 
-    pub fn register_table<T: TablePlugin + Default + Send>(
-        &mut self,
-    ) -> Result<Handle<T>, thrift::Error> {
-        let info = InternalExtensionInfo::new(
-            Some(T::NAME.to_string()),
-            env!("CARGO_PKG_VERSION").to_string(),
-            None,
-            None,
-        );
-        let registry = serde_json::from_value(json!({
-            "table": {
-                (T::NAME) : T::routes(),
-            }
-        }))
-        .map_err(|e| {
-            ApplicationError::new(
-                thrift::ApplicationErrorKind::InternalError,
-                format!("Failed to generate routes: {}", e),
-            )
-        })?;
-        let status = self.register_extension(info, registry)?;
-        debug!(
-            "registered extension from {}, got back {:?}",
-            std::any::type_name::<T>(),
-            &status
-        );
-        let uuid = status.uuid.ok_or_else(|| {
-            ApplicationError::new(
-                thrift::ApplicationErrorKind::ProtocolError,
-                "Got no UUID from osquery",
-            )
-        })?;
-        Ok(Handle::new(&self.socket_path, uuid))
+    /// Convenience function for registering a table
+    pub fn register_table<T>(&mut self, table: T) -> Result<Handle<T>, thrift::Error>
+    where
+        T: Plugin,
+        thrift::Error: From<T::Error>,
+    {
+        table.install(self)
     }
 }
 
@@ -350,7 +359,13 @@ where
 
         let output = match action.as_str() {
             "generate" => self
-                .generate(&query)?
+                .generate(&query)
+                .map_err(|e| {
+                    thrift::Error::Application(ApplicationError::new(
+                        thrift::ApplicationErrorKind::InternalError,
+                        e.to_string(),
+                    ))
+                })?
                 .into_iter()
                 .map(|v| {
                     v.into_iter()
@@ -358,10 +373,22 @@ where
                         .collect::<BTreeMap<_, _>>()
                 })
                 .collect(),
-            "columns" => Self::COLUMNS
+            "columns" => self
+                .columns()
+                .map_err(|e| {
+                    thrift::Error::Application(ApplicationError::new(
+                        thrift::ApplicationErrorKind::InternalError,
+                        e.to_string(),
+                    ))
+                })?
                 .iter()
-                .cloned()
-                .map(|c| btreemap! { c.name.to_string() => c.kind.to_string() })
+                .map(|c| {
+                    let (key, val) = c.to_pair();
+                    btreemap! {
+                        "name".to_string() => key,
+                        "type".to_string() => val.to_string(),
+                    }
+                })
                 .collect::<Vec<_>>(),
             other => {
                 return Err(thrift::Error::Protocol(ProtocolError::new(

@@ -17,6 +17,7 @@ readme = "../README.md"
 dirs = "*"
 
 [dependencies]
+anyhow = "*"
 dirs = "*"
 crossbeam = "*"
 derive_more = "*"

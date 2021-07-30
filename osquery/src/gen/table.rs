@@ -21,8 +21,14 @@ pub type Row = HashMap<String, String>;
 // create ColumnDefinition structs.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Column {
-    pub name: &'static str,
+    pub name: String,
     pub kind: ColumnType,
+}
+
+impl Column {
+    pub fn to_pair(&self) -> (String, ColumnType) {
+        (self.name.to_string(), self.kind)
+    }
 }
 
 // TextColumn is a helper for defining columns containing strings.
@@ -32,7 +38,7 @@ pub struct Column {
 // values.
 // ColumnType is a strongly typed representation of the data type string for a
 // column definition. The named constants should be used.
-#[derive(strum::ToString, Serialize, Deserialize, Debug, Clone)]
+#[derive(strum::ToString, Serialize, Deserialize, Debug, Clone, Copy)]
 #[strum(serialize_all = "UPPERCASE")]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ColumnType {
@@ -48,7 +54,7 @@ pub enum ColumnType {
 // that can optionally be used to optimize the table generation. Note that the
 // osquery SQLite engine will perform the filtering with these constraints, so
 // it is not mandatory that they be used in table generation.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryContext {
     pub cols_used: Vec<String>,
