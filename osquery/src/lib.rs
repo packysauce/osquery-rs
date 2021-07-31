@@ -157,11 +157,14 @@ pub struct Handle<T> {
     server: T,
 }
 
+pub trait PluginError: std::error::Error {}
+impl<T> PluginError for T where T: std::error::Error + Send + Sync + Into<anyhow::Error> + 'static {}
+
 pub trait Plugin: Routes + Sized {
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: PluginError;
     const NAME: &'static str;
     fn new() -> Self;
-    fn install(self, client: &mut Client) -> Result<Handle<Self>, thrift::Error> {
+    fn install(self, client: &mut Client) -> Result<Handle<Self>, anyhow::Error> {
         let info = InternalExtensionInfo::new(
             Some(Self::NAME.to_string()),
             env!("CARGO_PKG_VERSION").to_string(),
@@ -174,10 +177,10 @@ pub trait Plugin: Routes + Sized {
             }
         }))
         .map_err(|e| {
-            ApplicationError::new(
+            thrift::Error::Application(ApplicationError::new(
                 thrift::ApplicationErrorKind::InternalError,
                 format!("Failed to generate routes: {}", e),
-            )
+            ))
         })?;
         let status = client.register_extension(info, registry)?;
         debug!(
@@ -186,10 +189,10 @@ pub trait Plugin: Routes + Sized {
             &status
         );
         let uuid = status.uuid.ok_or_else(|| {
-            ApplicationError::new(
+            thrift::Error::Application(ApplicationError::new(
                 thrift::ApplicationErrorKind::ProtocolError,
                 "Got no UUID from osquery",
-            )
+            ))
         })?;
         Ok(Handle::new(client.socket_path(uuid)?, self))
     }
@@ -274,7 +277,6 @@ pub struct Client {
 }
 
 impl Client {
-
     pub fn socket_path(&self, uuid: ExtensionRouteUUID) -> Result<PathBuf, std::io::Error> {
         let mut socket_path = self.socket_path.clone();
         let mut name = socket_path
@@ -287,7 +289,6 @@ impl Client {
         socket_path.set_file_name(name);
         Ok(socket_path)
     }
-
 
     pub fn connect<P: AsRef<Path>>(path: P, timeout: Duration) -> Result<Self, thrift::Error> {
         let reader = UnixStream::connect(&path)?;
@@ -304,12 +305,12 @@ impl Client {
     }
 
     /// Convenience function for registering a table
-    pub fn register_table<T>(&mut self, table: T) -> Result<Handle<T>, thrift::Error>
+    pub fn register_table<T>(&mut self, table: T) -> Result<Handle<T>, anyhow::Error>
     where
         T: Plugin,
-        thrift::Error: From<T::Error>,
+        anyhow::Error: From<T::Error>,
     {
-        table.install(self)
+        Ok(table.install(self)?)
     }
 }
 
